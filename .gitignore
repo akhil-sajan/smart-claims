@@ -1,0 +1,12 @@
+# Raw sample data is large and not meant to live in git history.
+# See data/README.md for how to (re)source it.
+/data/**
+!/data/README.md
+
+__pycache__/
+*.pyc
+.venv/
+.env
+.ipynb_checkpoints/
+.databricks/
+*.egg-info/
