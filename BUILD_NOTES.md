@@ -10,8 +10,10 @@ for architecture/table names, not as a source to paste from.
 ## Status
 
 - [x] Phase 0a: AWS CLI + Databricks CLI installed locally (winget)
-- [ ] Phase 0b: `aws configure` / `databricks auth login` — run by you, not me
-- [ ] Phase 1: AWS resources (S3 bucket, Kinesis stream, IAM role)
+- [x] Phase 0b: AWS (`aws sts get-caller-identity` — account 265544358795) and
+      Databricks (`dbc-ab976425-7930.cloud.databricks.com`) both authenticated
+- [~] Phase 1: AWS resources — S3 bucket + IAM role done; Kinesis deferred to
+      Phase 4 (see below)
 - [ ] Phase 2: Databricks Unity Catalog setup (catalog/schemas/volumes)
 - [ ] Phase 3: SQL Server (real RDS instance, per your choice) + CDC
 - [ ] Phase 4: Data ingestion (S3 upload, Kinesis producer)
@@ -39,12 +41,22 @@ for architecture/table names, not as a source to paste from.
 - Consumption "App" — upstream course repo never published this piece
   (`README.md` says "To be uploaded"). We'll design our own once we get to Phase 7.
 
-## Phase 1 — AWS resources (next up)
+## Phase 1 — AWS resources
 
-- [ ] S3 bucket for landing data (images, training_imgs, metadata)
-- [ ] Kinesis Data Stream for telematics
-- [ ] IAM role/instance profile for Databricks to read Kinesis + S3
-- [ ] RDS SQL Server instance
+- [x] S3 bucket for landing data: `smart-claims-dev-265544358795` (us-east-1,
+      public access blocked, SSE-S3 default encryption)
+- [x] IAM role for Databricks: `smart-claims-databricks-role` (trust policy:
+      Databricks account 414351767826 + self-assume; inline policy
+      `smart-claims-s3-access` scoped to the bucket above)
+- [x] Databricks storage credential `smart_claims_s3_cred` (validated, all
+      checks pass) + external location `smart_claims_landing` ->
+      `s3://smart-claims-dev-265544358795/`
+- [ ] Kinesis Data Stream for telematics — **deferred to Phase 4**. Costs
+      ~$0.36/day while it exists, and isn't needed until we're actually
+      replaying telematics data, so create it then and delete it between
+      sessions to avoid idle cost. This is a personal/self-funded project —
+      default to cost-minimal choices like this.
+- [ ] RDS SQL Server instance (Phase 3)
 
 ## Phase 2 — Databricks workspace setup
 
