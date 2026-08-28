@@ -14,8 +14,8 @@ for architecture/table names, not as a source to paste from.
       Databricks (`dbc-ab976425-7930.cloud.databricks.com`) both authenticated
 - [~] Phase 1: AWS resources — S3 bucket + IAM role done; Kinesis deferred to
       Phase 4 (see below)
-- [ ] Phase 2: Databricks Unity Catalog setup (catalog/schemas/volumes)
-- [ ] Phase 3: SQL Server (real RDS instance, per your choice) + CDC
+- [x] Phase 2: Databricks Unity Catalog setup (catalog/schemas/volumes)
+- [x] Phase 3: SQL Server (real RDS instance) + CDC ingestion into `01_bronze`
 - [ ] Phase 4: Data ingestion (S3 upload, Kinesis producer)
 - [ ] Phase 5: Medallion transforms (bronze -> silver -> gold)
 - [ ] Phase 6: ML (damage classifier + rule engine)
@@ -60,21 +60,63 @@ for architecture/table names, not as a source to paste from.
 
 ## Phase 2 — Databricks workspace setup
 
-- [ ] Unity Catalog catalog `smart_claims_dev` + schemas `00_landing`/`01_bronze`/
-      `02_silver`/`03_gold`
-- [ ] Volumes under `00_landing` for images/training_imgs/metadata
-- [ ] Storage credential + external location for the S3 bucket
-- [ ] Service credential for Kinesis
-- [ ] Compute: cluster/serverless for pipelines; ML-capable compute for fine-tuning
+- [x] Unity Catalog catalog `smart_claims_dev` (storage root explicitly set to
+      `s3://smart-claims-dev-265544358795/` — first attempt used Databricks'
+      default managed storage, which Lakeflow Connect pipelines reject; catalog
+      was recreated with an explicit `--storage-root`) + schemas
+      `00_landing`/`01_bronze`/`02_silver`/`03_gold`
+- [x] Volumes under `00_landing`: `claim_images`, `training_imgs`, `claim_metadata`
+- [x] Storage credential + external location for the S3 bucket (Phase 1)
+- [ ] Service credential for Kinesis (Phase 4, when Kinesis is created)
+- [x] Compute: Serverless Starter Warehouse + serverless pipeline compute
 
 ## Phase 3 — SQL Server + CDC
 
-- [ ] Create RDS SQL Server instance
-- [ ] Create schema: policy / claim / customer tables (own DDL, in
-      `src/02_sql_server_ingestion/`)
-- [ ] Load `data/sql_server/{customers,policies,claims}.csv`
-- [ ] Enable change tracking + CDC on the RDS instance and tables
-- [ ] Lakeflow Connect SQL Server CDC gateway into `01_bronze.{policy,claim,customer}`
+- [x] RDS SQL Server instance: `smart-claims-sqlserver` (Express edition,
+      `db.t3.micro`, 20GB gp3, us-east-1, ~$18/month running / ~$2.30/month
+      stopped — stop it between sessions via RDS console when not in use)
+- [x] Database `smart_claims` with `customers`/`policies`/`claims` tables (own
+      DDL). Loaded via staging tables (`*_staging`, all-text columns) then
+      cleaned/cast into the real typed tables — see chat history for the exact
+      migration SQL. `policies` had ~183 duplicate `policy_no` rows in source
+      data, deduped by keeping the highest-premium row per policy.
+- [x] Change Tracking enabled (database + all 3 tables) — Express edition
+      doesn't support full CDC, but Lakeflow Connect's SQL Server connector is
+      built around Change Tracking anyway.
+- [x] Dedicated login `databricks_ingest` (not the admin login) for ingestion,
+      permissions fixed via Databricks' official
+      `src/02_sql_server_ingestion/lakeflow_utility_script.sql` (installs
+      `lakeflowFixPermissions`/`lakeflowSetupChangeTracking`/
+      `lakeflowSetupChangeDataCapture` procedures — re-run
+      `EXEC dbo.lakeflowFixPermissions @User='databricks_ingest', @Tables='ALL'`
+      any time permissions need re-syncing, e.g. after adding new tables)
+- [x] Lakeflow Connect SQL Server CDC pipeline `smart_claims_sqlserver_ingestion`
+      -> `smart_claims_dev.01_bronze.{customers,policies,claims}`, confirmed
+      with real rows landed. Runs in continuous mode (stays running until
+      manually stopped) — stopped after initial load to avoid ongoing
+      serverless compute cost; restart it from Databricks' Pipelines UI when
+      fresh syncs are needed.
+
+### Gotchas hit along the way (useful if redoing this)
+- RDS "Easy create" and default template settings inflate cost significantly
+  (defaulted to 200GB storage + would've used Multi-AZ) — use "Full
+  configuration" and explicitly set Single-AZ + 20GB + gp3.
+- Azure Data Studio is retired (Feb 2026) — use VS Code + the MSSQL extension
+  instead.
+- RDS BULK INSERT can't read local client files (the SQL Server engine runs on
+  AWS, not your PC) — use the MSSQL extension's Import Wizard instead, which
+  streams over the client connection.
+- The workspace's Databricks metastore is homed in us-east-2 while AWS
+  resources are in us-east-1 (cross-region, minor cost/latency only, not
+  worth fixing at this scale).
+- Databricks' ingestion compute connects from a specific, workspace-dependent
+  outbound IP — not published in any static Databricks doc. Found it by
+  temporarily attaching a VPC Flow Log (REJECT traffic only) to the RDS
+  instance's ENI and reading the rejected connection's source IP from
+  CloudWatch Logs, rather than guessing.
+- The Databricks connection needed `trustServerCertificate: true` in its
+  options (RDS presents an Amazon-issued cert Databricks doesn't trust by
+  default) — set via `databricks connections update`.
 
 ## Phase 4 — Data ingestion
 
