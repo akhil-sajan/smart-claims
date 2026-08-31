@@ -12,12 +12,16 @@ for architecture/table names, not as a source to paste from.
 - [x] Phase 0a: AWS CLI + Databricks CLI installed locally (winget)
 - [x] Phase 0b: AWS (`aws sts get-caller-identity` — account 265544358795) and
       Databricks (`dbc-ab976425-7930.cloud.databricks.com`) both authenticated
-- [~] Phase 1: AWS resources — S3 bucket + IAM role done; Kinesis deferred to
-      Phase 4 (see below)
+- [x] Phase 1: AWS resources — S3 bucket + IAM role (Kinesis stream itself is
+      created/deleted per-session in Phase 4, not left standing)
 - [x] Phase 2: Databricks Unity Catalog setup (catalog/schemas/volumes)
 - [x] Phase 3: SQL Server (real RDS instance) + CDC ingestion into `01_bronze`
-- [ ] Phase 4: Data ingestion (S3 upload, Kinesis producer)
-- [ ] Phase 5: Medallion transforms (bronze -> silver -> gold)
+- [x] Phase 4: Data ingestion (S3 upload, Kinesis producer) — all 7 `01_bronze`
+      tables now exist: `customers`/`policies`/`claims` (SQL Server CDC),
+      `claim_images`/`claim_images_meta`/`training_images` (S3 files via
+      standalone Auto Loader streaming tables), `telematics` (Kinesis via
+      `read_kinesis()`)
+- [x] Phase 5: Medallion transforms (bronze -> silver -> gold)
 - [ ] Phase 6: ML (damage classifier + rule engine)
 - [ ] Phase 7: Consumption (dashboard + app)
 
@@ -51,12 +55,11 @@ for architecture/table names, not as a source to paste from.
 - [x] Databricks storage credential `smart_claims_s3_cred` (validated, all
       checks pass) + external location `smart_claims_landing` ->
       `s3://smart-claims-dev-265544358795/`
-- [ ] Kinesis Data Stream for telematics — **deferred to Phase 4**. Costs
-      ~$0.36/day while it exists, and isn't needed until we're actually
-      replaying telematics data, so create it then and delete it between
-      sessions to avoid idle cost. This is a personal/self-funded project —
-      default to cost-minimal choices like this.
-- [ ] RDS SQL Server instance (Phase 3)
+- [x] Kinesis Data Stream for telematics — built and torn down as part of
+      Phase 4 (see below), not a standing resource. Create fresh, feed it,
+      verify, delete — repeat this pattern any time telematics data needs
+      reloading, rather than leaving it running between sessions.
+- [x] RDS SQL Server instance (Phase 3)
 
 ## Phase 2 — Databricks workspace setup
 
@@ -120,17 +123,67 @@ for architecture/table names, not as a source to paste from.
 
 ## Phase 4 — Data ingestion
 
-- [ ] Upload `data/claims/images/*`, `data/claims/metadata/image_metadata.csv`,
-      `data/training_imgs/*` to S3 / landing Volumes
-- [ ] Write a Kinesis producer that replays `data/telematics/*.parquet` as events
-- [ ] Auto Loader pipelines for S3 -> bronze
+- [x] Uploaded `data/claims/images/*` (15 files), `data/claims/metadata/image_metadata.csv`,
+      `data/training_imgs/*` (56 files) to the `00_landing` Volumes via
+      `databricks fs cp -r`
+- [x] Standalone streaming tables (Databricks SQL Editor, `read_files()` +
+      `CREATE OR REFRESH STREAMING TABLE`, no pipeline needed) load
+      `00_landing` -> `01_bronze.{claim_images,training_images,claim_images_meta}`.
+      Re-run `REFRESH STREAMING TABLE <name>` after uploading new files to
+      pick them up.
+- [x] Kinesis producer (`src/01_streaming_ingestion/kinesis_producer.py`) reads
+      `data/telematics/*.parquet` with DuckDB (pyarrow is blocked by a local
+      Windows Application Control policy on this machine — DuckDB works fine
+      as the parquet reader instead) and replays all 780,060 rows into Kinesis
+      via `boto3` batched `put_records` (partition key = `chassis_no`). On-demand
+      Kinesis stream `smart-claims-telematics` is created fresh, fed, verified
+      via CloudWatch `IncomingRecords`, then **deleted immediately after** —
+      it's not a standing resource. A leftover stream (`telematics-stream-tmh`,
+      from pre-conversation experimentation, same as the old `insurance_claim`
+      catalog) was found and deleted first.
+- [x] Standalone streaming table `01_bronze.telematics` via
+      `read_kinesis(streamName, serviceCredential, region, initialPosition =>
+      'trim_horizon')`, using a Databricks **service credential**
+      (`smart_claims_kinesis_cred`, purpose=SERVICE, same reused IAM role as
+      the S3 storage credential — just needed a `smart-claims-kinesis-access`
+      policy added to it for `kinesis:GetRecords`/`GetShardIterator`/etc.,
+      scoped to the stream's ARN). `initialPosition => 'trim_horizon'` reads
+      from the start of the stream, not just new records.
+
+### Gotchas
+- **Serverless compute quota**: hit `RESOURCE_EXHAUSTED` creating the
+  streaming tables because the SQL Server ingestion pipeline
+  (`smart_claims_sqlserver_ingestion`) was still silently running in the
+  background (had been for ~3 hours, re-triggering hourly) — stopping it
+  freed up capacity. **Always verify a pipeline shows `IDLE` after use**
+  (`databricks pipelines get <id>`), don't assume a stop/retry click actually
+  stopped it.
+- **RDS "auto recovery"**: after being manually stopped, RDS came back up on
+  its own days later with event message "Recovery of the DB instance has
+  started" — not something we triggered. Not a data-safety concern, but it
+  does mean compute cost resumes; check status and re-stop it after any gap
+  in sessions rather than assuming a stopped instance stays stopped
+  indefinitely.
 
 ## Phase 5 — Medallion transforms
 
-- [ ] Bronze ingestion for Kinesis telematics stream
-- [ ] bronze -> silver cleaning (per-table quality rules)
-- [ ] silver -> gold aggregation/joins (telematics avg, claim+policy+customer join,
-      geocoded claim locations)
+- [x] Bronze -> silver cleaning (`src/04_medallion_transformation/bronze_to_silver.sql`):
+      `customers` (drop `.0` from IDs, parse birth dates), `policies`/`claims`
+      (filter null keys + nonsensical dates), `telematics` (**unpack the raw
+      Kinesis JSON payload** in the `data` binary column into real columns,
+      filter impossible speed/GPS readings), `claim_images`/`training_images`
+      (extract filename + the severity/damage label baked into the filename),
+      `claim_images_meta` (drop malformed rows). No rows dropped except ~198
+      claims with a missing key and some `.jpg`/`.png` naming edge cases.
+- [x] Silver -> gold (`src/04_medallion_transformation/silver_to_gold.sql`):
+      `aggregated_telematics` (per-vehicle avg/max/min speed + event count),
+      `customer_claim_policy` (claims + policies + customers joined, one row
+      per claim — 12,793 rows, matches silver `claims` exactly), plus that
+      joined with `aggregated_telematics` — 12,788/12,793 claims (99.96%)
+      matched a vehicle's telematics summary.
+- Skipped geocoding claim locations from the original plan (no clear source
+  lat/lon on the claims table itself — telematics has GPS, but per-claim
+  location wasn't part of the source data). Revisit if needed later.
 
 ## Phase 6 — ML
 
