@@ -22,7 +22,7 @@ for architecture/table names, not as a source to paste from.
       standalone Auto Loader streaming tables), `telematics` (Kinesis via
       `read_kinesis()`)
 - [x] Phase 5: Medallion transforms (bronze -> silver -> gold)
-- [ ] Phase 6: ML (damage classifier + rule engine)
+- [x] Phase 6: ML (damage classifier + rule engine)
 - [ ] Phase 7: Consumption (dashboard + app)
 
 ## Target architecture (Unity Catalog catalog: `smart_claims_dev`)
@@ -187,11 +187,45 @@ for architecture/table names, not as a source to paste from.
 
 ## Phase 6 — ML
 
-- [ ] Fine-tune an image classifier on `training_images` (ok/minor/major),
-      log + register to Unity Catalog model registry
-- [ ] Rule engine: a rules table + dynamic SQL-expression evaluation over claims
-      (e.g. invalid policy dates, amount exceeds policy limit, reported severity
-      vs. model severity mismatch, speed at time of incident, etc.)
+- [x] Rule engine (`src/05_machine_learning/claims_rules_setup.sql` +
+      `rule_engine.py`): a rules table (`02_silver.claims_rules`, one row per
+      rule storing its condition as a plain SQL boolean expression string) +
+      a small Python loop that reads it and checks every enabled rule against
+      every claim in `03_gold.customer_claim_policy_telematics`, writing
+      matches to `03_gold.claims_flags`. Adding a rule later = one `INSERT`,
+      no code change. Thresholds were initially picked blind and needed
+      correcting after checking the real data distribution (see gotchas).
+- [x] Damage-severity image classifier (`src/05_machine_learning/damage_classifier.py`):
+      transfer learning on a pretrained MobileNetV2 (backbone frozen, only the
+      final classification layer retrained) using the 56 labeled
+      `training_images`, tracked and registered via MLflow to Unity Catalog as
+      `smart_claims_dev.03_gold.claims_damage_classifier`. Applied to the 15
+      real `claim_images`, predictions saved to
+      `03_gold.claims_damage_level`. **Caveat**: 56 images is a tiny dataset —
+      98% training accuracy almost certainly reflects memorization, not a
+      generalizable model. Fine as a working proof-of-concept pipeline, not
+      representative of real-world accuracy.
+
+### Gotchas
+- **Rule thresholds picked without checking the data first**: `high_speed_before_incident`
+  used a threshold of 120 before checking that this telematics sample only
+  ranges 57-72 (zero matches, silently). `reported_suspicious_activity` used
+  `= 'true'` before checking the actual column values (which are `'0'`/`'1'`
+  text, not `'true'`/`'false'`) — also zero matches. **Always check a
+  column's actual value range/distribution before writing a threshold or
+  equality rule against it.** `claim_exceeds_sum_insured` (any excess)
+  initially flagged 48% of all claims — tightened to `> sum_insured * 1.5`
+  for a more meaningful signal.
+- **Serverless notebook + `%pip install` + `dbutils.library.restartPython()`
+  together lose the installed packages** (`ModuleNotFoundError: No module
+  named 'torch'` on the next cell, even though the install reported
+  success). Fix: install via `subprocess.check_call([sys.executable, "-m",
+  "pip", "install", ...])` in the same cell as the code that needs it,
+  instead of a separate `%pip` + restart cell.
+- **Unity Catalog requires a model `signature`** (input/output shape) on
+  `mlflow.pytorch.log_model(..., registered_model_name=...)` — infer one with
+  `mlflow.models.infer_signature()` from a sample batch before registering,
+  or the registration fails.
 
 ## Phase 7 — Consumption
 
