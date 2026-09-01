@@ -19,7 +19,26 @@ WHERE policy_no IS NOT NULL
   AND (pol_eff_date IS NULL OR pol_expiry_date IS NULL OR pol_eff_date <= pol_expiry_date);
 
 CREATE OR REPLACE TABLE smart_claims_dev.02_silver.claims AS
-SELECT *
+SELECT
+  claim_no,
+  policy_no,
+  claim_date,
+  months_as_customer,
+  injury,
+  property,
+  vehicle,
+  total,
+  NULLIF(collision_type, 'null') AS collision_type,
+  number_of_vehicles_involved,
+  age,
+  NULLIF(insured_relationship, 'null') AS insured_relationship,
+  license_issue_date,
+  report_date,
+  hour,
+  type,
+  severity,
+  number_of_witnesses,
+  suspicious_activity
 FROM smart_claims_dev.01_bronze.claims
 WHERE claim_no IS NOT NULL
   AND policy_no IS NOT NULL;

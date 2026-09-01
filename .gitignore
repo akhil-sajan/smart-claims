@@ -10,3 +10,7 @@ __pycache__/
 .ipynb_checkpoints/
 .databricks/
 *.egg-info/
+
+# Internal build journal / walkthrough — local reference only, not published
+/BUILD_NOTES.md
+/PROJECT_WALKTHROUGH.md
